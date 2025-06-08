@@ -13,12 +13,18 @@ from sklearn.metrics import silhouette_score
 import pyudev
 from plotly.subplots import make_subplots
 
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
 import os
 os.system("fuser -k 8050/tcp > /dev/null 2>&1")
 
+training_complete = False
+
 app = dash.Dash(__name__)
 
-app.title = "Live Dual UE Dashboard"
+app.title = "Live Training Dashboard"
 
 # Shared data buffer for live updates
 data_buffer = []
@@ -26,7 +32,6 @@ data_lock = threading.Lock()
 
 # Clustering status shared
 clustering_status = "Waiting for data..."
-training_complete_message = ""
 
 
 def parse_fields(line, mode):
@@ -121,18 +126,19 @@ def monitor_ue(name, port_path):
             time.sleep(3)
 
 def cluster_loop():
-    global clustering_status, training_complete_message
-    max_data_points = 120
+    global clustering_status
+    max_data_points = 300
     target_score = 0.4
     training_stopped = False
 
     while not training_stopped:
         time.sleep(5)
-
         with data_lock:
             if len(data_buffer) < 5:
                 continue
-            df = pd.DataFrame(data_buffer)
+            buffer_snapshot = data_buffer.copy()
+        df = pd.DataFrame(buffer_snapshot)
+
 
         df.drop('Time', axis=1, inplace=True)
         scaler = StandardScaler()
@@ -145,7 +151,7 @@ def cluster_loop():
         score = silhouette_score(scaled, labels)
 
         clustering_status = f"Samples: {len(df)}, Silhouette Score: {score:.2f}"
-        print(f"[CLUSTER LOOP] {clustering_status}")
+        # print(f"[CLUSTER LOOP] {clustering_status}")
 
         with data_lock:
             for i in range(len(labels)):
@@ -154,17 +160,110 @@ def cluster_loop():
         if score >= target_score and len(df) >= max_data_points:
             print(f"\n✅ Training complete. Score: {score:.2f}, Samples: {len(df)}")
             print("🔽 Saving training data to CSV...")
-            df['Time'] = [d['Time'] for d in data_buffer]
-            df.to_csv("training_dataset.csv", index=False)
 
+            # df['Time'] = [d['Time'] for d in data_buffer]
+            df['Time'] = [d['Time'] for d in buffer_snapshot]            
+
+
+            # Get centroids and inverse-transform them
             centroids = kmeans.cluster_centers_
             inverse_centroids = scaler.inverse_transform(centroids)
 
-            training_complete_message = "Training complete. Cluster centroids:<br>"
-            for i, centroid in enumerate(inverse_centroids):
-                training_complete_message += f"Cluster {i}: RSRP={centroid[0]:.2f}, RSRQ={centroid[1]:.2f}, SINR={centroid[2]:.2f}<br>"
+
+
+            # Sort clusters by SINR descending
+            sorted_clusters = sorted(
+                [(i, c) for i, c in enumerate(inverse_centroids)],
+                key=lambda x: -x[1][2]
+            )                       
+
+            # Create mapping: old_cluster → new_sorted_cluster
+            new_cluster_map = {old: new for new, (old, _) in enumerate(sorted_clusters)}
+
+            # Overwrite cluster IDs in df and data_buffer
+            df['Cluster'] = [new_cluster_map[label] for label in kmeans.labels_]
+            with data_lock:
+                for i in range(len(buffer_snapshot)):
+                    buffer_snapshot[i]['Cluster'] = new_cluster_map[labels[i]]
+
+
+
+            # PCA for 2D visualization
+            pca = PCA(n_components=2)
+            reduced_features = pca.fit_transform(scaled)
+
+
+            # Reorder centroids and PCA-reduced centroids to match new cluster IDs
+            inverse_centroids = np.array([inverse_centroids[old] for old, _ in sorted_clusters])
+            centroids_reduced = pca.transform(np.array([centroids[old] for old, _ in sorted_clusters]))
+
+            # Save final labeled training data
+            df.to_csv("training_dataset.csv", index=False)
 
             training_stopped = True
+            global training_complete
+            training_complete = True
+
+
+            colors = ['green', 'orange', 'red']
+            labels_text = ['Green Cluster Centroid', 'Orange Cluster Centroid', 'Red Cluster Centroid']
+
+
+
+            plt.figure(figsize=(7, 5), dpi=150)
+
+            # Plot clusters
+            for cluster_id in range(3):
+                mask = df['Cluster'] == cluster_id
+                plt.scatter(
+                    -1 * reduced_features[mask, 0],
+                    -1 * reduced_features[mask, 1],
+                    c=colors[cluster_id],
+                    alpha=0.7,
+                    s=50,
+                    edgecolor='k',
+                )
+
+            # Plot centroids and construct legend labels
+            legend_handles = []
+            for cluster_id in range(3):
+                reduced_centroid = centroids_reduced[cluster_id]
+                # true_centroid = inverse_centroids[sorted_clusters[cluster_id][0]]
+                true_centroid = inverse_centroids[cluster_id]
+                label = f"{labels_text[cluster_id]}: RSRP={true_centroid[0]:.1f}, RSRQ={true_centroid[1]:.1f}, SINR={true_centroid[2]:.1f}"
+
+                handle = plt.scatter(
+                    -1 * reduced_centroid[0],
+                    -1 * reduced_centroid[1],
+                    color=colors[cluster_id],
+                    marker='X',
+                    s=200,
+                    label=label
+                )
+                legend_handles.append(handle)
+
+            plt.xlabel('Principal Component 1', fontsize=14)
+            plt.ylabel('Principal Component 2', fontsize=14)
+
+            # Legend below the plot
+            plt.legend(
+                handles=legend_handles,
+                loc='lower center',
+                bbox_to_anchor=(0.5, -0.35),
+                ncol=1,
+                fontsize=10,
+                frameon=False
+            )
+
+            plt.tight_layout()
+            plt.savefig("cluster_vis_pca.pdf", bbox_inches='tight')
+            plt.show()
+
+
+
+
+
+
 
 ue_ports = find_ue_ports()
 if len(ue_ports) >= 2:
@@ -177,7 +276,8 @@ threading.Thread(target=cluster_loop, daemon=True).start()
 
 app.layout = html.Div([
     html.H1("Live UE Signal & Clustering Dashboard", style={'textAlign': 'center'}),
-    dcc.Interval(id='interval', interval=250, n_intervals=0),
+    # dcc.Interval(id='interval', interval=250, n_intervals=0),
+    dcc.Interval(id='interval', interval=250, n_intervals=0, disabled=False),
 
     html.Div([
         html.Div([
@@ -210,32 +310,30 @@ app.layout = html.Div([
             'fontWeight': 'bold',
             'fontSize': '18px',
             'marginTop': '10px'
-        }),
-        html.Div(id='training-summary', style={
-            'textAlign': 'center',
-            'color': 'green',
-            'fontWeight': 'bold',
-            'fontSize': '16px',
-            'marginTop': '5px'
         })
     ])
 ])
 
+
+
 @app.callback(
     [Output('ue0_radio', 'figure'),
-     Output('ue1_radio', 'figure'),
-     Output('ue0_cluster', 'figure'),
-     Output('ue1_cluster', 'figure'),
-     Output('clustering-status', 'children'),
-     Output('training-summary', 'children')],
+    Output('ue1_radio', 'figure'),
+    Output('ue0_cluster', 'figure'),
+    Output('ue1_cluster', 'figure'),
+    Output('clustering-status', 'children'),
+    Output('interval', 'disabled')],
     Input('interval', 'n_intervals')
 )
+
+
 def update_graph(n):
-    global clustering_status, training_complete_message
+    global clustering_status
     with data_lock:
-        df = pd.DataFrame(data_buffer)
+        df = pd.DataFrame(data_buffer)      
+        
         if df.empty or 'UE' not in df.columns:
-            return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No data", ""
+            return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No data"
 
     fig_ue0 = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02,
                             subplot_titles=("RSRP", "RSRQ", "SINR"))
@@ -258,7 +356,10 @@ def update_graph(n):
                 yaxis=dict(tickmode='array', tickvals=[0, 1, 2], range=[-0.5, 2.5])
             )
 
-    return fig_ue0, fig_ue1, fig_c0, fig_c1, clustering_status, training_complete_message
+    # return fig_ue0, fig_ue1, fig_c0, fig_c1, clustering_status
+    
+    return fig_ue0, fig_ue1, fig_c0, fig_c1, clustering_status, training_complete
+
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False, port=8050)
