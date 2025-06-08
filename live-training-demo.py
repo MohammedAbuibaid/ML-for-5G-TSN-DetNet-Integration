@@ -17,6 +17,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
+import joblib
+import json
+
 import os
 os.system("fuser -k 8050/tcp > /dev/null 2>&1")
 
@@ -65,6 +68,8 @@ def find_ue_ports():
             selected_ports.append(sorted_ports[2])
     return sorted(selected_ports)
 
+
+
 def monitor_ue(name, port_path):
     ser = None
     while True:
@@ -74,7 +79,7 @@ def monitor_ue(name, port_path):
                 print(f"[{name}] Connected to {port_path}")
 
             ser.write(b'AT+QENG="servingcell"\r')
-            time.sleep(1)
+            time.sleep(0.25)
             response = ser.read_all().decode(errors='ignore').strip()
 
             lines = response.splitlines()
@@ -125,6 +130,7 @@ def monitor_ue(name, port_path):
                 ser = None
             time.sleep(3)
 
+
 def cluster_loop():
     global clustering_status
     max_data_points = 300
@@ -139,7 +145,6 @@ def cluster_loop():
             buffer_snapshot = data_buffer.copy()
         df = pd.DataFrame(buffer_snapshot)
 
-
         df.drop('Time', axis=1, inplace=True)
         scaler = StandardScaler()
         scaled = scaler.fit_transform(df[['RSRP', 'RSRQ', 'SINR']])
@@ -151,7 +156,6 @@ def cluster_loop():
         score = silhouette_score(scaled, labels)
 
         clustering_status = f"Samples: {len(df)}, Silhouette Score: {score:.2f}"
-        # print(f"[CLUSTER LOOP] {clustering_status}")
 
         with data_lock:
             for i in range(len(labels)):
@@ -159,60 +163,53 @@ def cluster_loop():
 
         if score >= target_score and len(df) >= max_data_points:
             print(f"\n✅ Training complete. Score: {score:.2f}, Samples: {len(df)}")
-            print("🔽 Saving training data to CSV...")
+            print("🔽 Saving training data and model...")
 
-            # df['Time'] = [d['Time'] for d in data_buffer]
-            df['Time'] = [d['Time'] for d in buffer_snapshot]            
+            df['Time'] = [d['Time'] for d in buffer_snapshot]
 
-
-            # Get centroids and inverse-transform them
             centroids = kmeans.cluster_centers_
             inverse_centroids = scaler.inverse_transform(centroids)
-
-
 
             # Sort clusters by SINR descending
             sorted_clusters = sorted(
                 [(i, c) for i, c in enumerate(inverse_centroids)],
                 key=lambda x: -x[1][2]
-            )                       
+            )
 
             # Create mapping: old_cluster → new_sorted_cluster
             new_cluster_map = {old: new for new, (old, _) in enumerate(sorted_clusters)}
 
-            # Overwrite cluster IDs in df and data_buffer
+            # Overwrite cluster IDs
             df['Cluster'] = [new_cluster_map[label] for label in kmeans.labels_]
             with data_lock:
                 for i in range(len(buffer_snapshot)):
                     buffer_snapshot[i]['Cluster'] = new_cluster_map[labels[i]]
 
+            # Save model components
+            joblib.dump(kmeans, "kmeans_model.pkl")
+            joblib.dump(scaler, "scaler.pkl")
+            with open("cluster_mapping.json", "w") as f:
+                json.dump(new_cluster_map, f)
 
-
-            # PCA for 2D visualization
-            pca = PCA(n_components=2)
-            reduced_features = pca.fit_transform(scaled)
-
-
-            # Reorder centroids and PCA-reduced centroids to match new cluster IDs
-            inverse_centroids = np.array([inverse_centroids[old] for old, _ in sorted_clusters])
-            centroids_reduced = pca.transform(np.array([centroids[old] for old, _ in sorted_clusters]))
-
-            # Save final labeled training data
+            # Save labeled dataset
             df.to_csv("training_dataset.csv", index=False)
 
             training_stopped = True
             global training_complete
             training_complete = True
 
+            # PCA and Plotting
+            pca = PCA(n_components=2)
+            reduced_features = pca.fit_transform(scaled)
+
+            inverse_centroids = np.array([inverse_centroids[old] for old, _ in sorted_clusters])
+            centroids_reduced = pca.transform(np.array([centroids[old] for old, _ in sorted_clusters]))
 
             colors = ['green', 'orange', 'red']
             labels_text = ['Green Cluster Centroid', 'Orange Cluster Centroid', 'Red Cluster Centroid']
 
-
-
             plt.figure(figsize=(7, 5), dpi=150)
 
-            # Plot clusters
             for cluster_id in range(3):
                 mask = df['Cluster'] == cluster_id
                 plt.scatter(
@@ -224,14 +221,11 @@ def cluster_loop():
                     edgecolor='k',
                 )
 
-            # Plot centroids and construct legend labels
             legend_handles = []
             for cluster_id in range(3):
                 reduced_centroid = centroids_reduced[cluster_id]
-                # true_centroid = inverse_centroids[sorted_clusters[cluster_id][0]]
                 true_centroid = inverse_centroids[cluster_id]
                 label = f"{labels_text[cluster_id]}: RSRP={true_centroid[0]:.1f}, RSRQ={true_centroid[1]:.1f}, SINR={true_centroid[2]:.1f}"
-
                 handle = plt.scatter(
                     -1 * reduced_centroid[0],
                     -1 * reduced_centroid[1],
@@ -244,8 +238,6 @@ def cluster_loop():
 
             plt.xlabel('Principal Component 1', fontsize=14)
             plt.ylabel('Principal Component 2', fontsize=14)
-
-            # Legend below the plot
             plt.legend(
                 handles=legend_handles,
                 loc='lower center',
@@ -254,11 +246,9 @@ def cluster_loop():
                 fontsize=10,
                 frameon=False
             )
-
             plt.tight_layout()
             plt.savefig("cluster_vis_pca.pdf", bbox_inches='tight')
             plt.show()
-
 
 
 
