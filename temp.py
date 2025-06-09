@@ -1,43 +1,40 @@
 import dash
 from dash import dcc, html
-import plotly.graph_objs as go
-import pandas as pd
 from dash.dependencies import Input, Output
-import threading
-import time
-import serial
-from datetime import datetime
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-import pyudev
+import plotly.graph_objs as go
 from plotly.subplots import make_subplots
+import threading
+import pandas as pd
+import numpy as np
+import joblib, json
+from sklearn.decomposition import PCA
+from datetime import datetime
+import serial
+import time
+import pyudev
+
 
 import os
 os.system("fuser -k 8050/tcp > /dev/null 2>&1")
 
-app = dash.Dash(__name__)
 
-app.title = "Live Dual UE Dashboard"
+# Load saved artifacts
+kmeans = joblib.load("kmeans_model.pkl")
+scaler = joblib.load("scaler.pkl")
+with open("cluster_mapping.json", "r") as f:
+    cluster_map = json.load(f)
 
-# Shared data buffer for live updates
-data_buffer = []
-data_lock = threading.Lock()
+# Setup PCA using fitted training data
+pca = PCA(n_components=2)
+pca.fit(scaler.transform(kmeans.cluster_centers_))  # Use centroids for fit
 
-# Clustering status shared
-clustering_status = "Waiting for data..."
-training_complete_message = ""
+# Buffers for live data
+ue0_buffer = []
+ue1_buffer = []
+lock = threading.Lock()
 
 
-def parse_fields(line, mode):
-    fields = line.strip().split(',')
-    if mode == "NR5G-SA":
-        return fields[13], fields[14], fields[15]
-    elif mode == "NR5G-NSA":
-        return fields[11], fields[12], fields[14]
-    elif mode == "LTE":
-        return fields[13], fields[14], fields[16]
-    return "NA", "NA", "NA"
+
 
 def find_ue_ports():
     context = pyudev.Context()
@@ -60,205 +57,295 @@ def find_ue_ports():
             selected_ports.append(sorted_ports[2])
     return sorted(selected_ports)
 
-def monitor_ue(name, port_path):
+
+
+# Serial reader
+def monitor_ue(name, port, buffer):
     ser = None
     while True:
         try:
             if ser is None or not ser.is_open:
-                ser = serial.Serial(port_path, baudrate=115200, timeout=5)
-                print(f"[{name}] Connected to {port_path}")
+                ser = serial.Serial(port, 115200, timeout=3)
+                print(f"[{name}] Connected to {port}")
 
             ser.write(b'AT+QENG="servingcell"\r')
+            time.sleep(0.5)
+            response = ser.read_all().decode(errors='ignore')
+            lines = [line for line in response.splitlines() if '+QENG:' in line]
+
+            # Basic mode matching
+            if any('NR5G-SA' in l for l in lines):
+                target = next(l for l in lines if 'NR5G-SA' in l)
+                fields = target.split(',')
+                rsrp, rsrq, sinr = float(fields[13]), float(fields[14]), float(fields[15])
+            elif any('NR5G-NSA' in l for l in lines):
+                lte = next(l for l in lines if '+QENG: "LTE"' in l)
+                fields = lte.split(',')
+                rsrp, rsrq, sinr = float(fields[11]), float(fields[12]), float(fields[14])
+            elif any(',"LTE",' in l for l in lines):
+                target = next(l for l in lines if ',"LTE",' in l)
+                fields = target.split(',')
+                rsrp, rsrq, sinr = float(fields[13]), float(fields[14]), float(fields[16])
+            else:
+                continue
+
+            features = np.array([[rsrp, rsrq, sinr]])
+            scaled = scaler.transform(features)
+            cluster = kmeans.predict(scaled)[0]
+            mapped = cluster_map[str(cluster)]
+            pc = pca.transform(scaled)[0]
+
+            with lock:
+                buffer.append({
+                    "Time": datetime.now(),
+                    "RSRP": rsrp,
+                    "RSRQ": rsrq,
+                    "SINR": sinr,
+                    "Cluster": mapped,
+                    "PC1": -1 * pc[0],
+                    "PC2": -1 * pc[1]
+                })
+
             time.sleep(1)
-            response = ser.read_all().decode(errors='ignore').strip()
 
-            lines = response.splitlines()
-            lines = [line for line in lines if "+QENG:" in line]
-
-            mode = "UNKNOWN"
-            rsrp = rsrq = sinr = "NA"
-
-            sa_line = next((l for l in lines if '"NR5G-SA"' in l), None)
-            nsa_line = next((l for l in lines if '"NR5G-NSA"' in l), None)
-            lte_line_nsa = next((l for l in lines if l.startswith('+QENG: "LTE"')), None)
-            lte_line = next((l for l in lines if ',"LTE",' in l and '"servingcell"' in l), None)
-
-            if sa_line:
-                mode = "NR5G-SA"
-                rsrp, rsrq, sinr = parse_fields(sa_line, mode)
-            elif nsa_line and lte_line_nsa:
-                mode = "NR5G-NSA"
-                rsrp, rsrq, sinr = parse_fields(lte_line_nsa, mode)
-            elif lte_line:
-                mode = "LTE"
-                rsrp, rsrq, sinr = parse_fields(lte_line, mode)
-
-            try:
-                rsrp_f = float(rsrp)
-                rsrq_f = float(rsrq)
-                sinr_f = float(sinr)
-                with data_lock:
-                    data_buffer.append({
-                        "UE": name,
-                        "RSRP": rsrp_f,
-                        "RSRQ": rsrq_f,
-                        "SINR": sinr_f,
-                        "Time": datetime.now(),
-                    })
-            except ValueError:
-                pass
-
-            time.sleep(0.25)
-
-        except (serial.SerialException, OSError) as e:
-            print(f"[{name}] Connection error: {e}. Retrying in 3 seconds...")
+        except Exception as e:
+            print(f"[{name}] Error: {e}")
             if ser:
-                try:
-                    ser.close()
-                except:
-                    pass
-                ser = None
+                try: ser.close()
+                except: pass
+            ser = None
             time.sleep(3)
 
-def cluster_loop():
-    global clustering_status, training_complete_message
-    max_data_points = 120
-    target_score = 0.4
-    training_stopped = False
-
-    while not training_stopped:
-        time.sleep(5)
-
-        with data_lock:
-            if len(data_buffer) < 5:
-                continue
-            df = pd.DataFrame(data_buffer)
-
-        df.drop('Time', axis=1, inplace=True)
-        scaler = StandardScaler()
-        scaled = scaler.fit_transform(df[['RSRP', 'RSRQ', 'SINR']])
-
-        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-        kmeans.fit(scaled)
-
-        labels = kmeans.labels_
-        score = silhouette_score(scaled, labels)
-
-        clustering_status = f"Samples: {len(df)}, Silhouette Score: {score:.2f}"
-        print(f"[CLUSTER LOOP] {clustering_status}")
-
-        with data_lock:
-            for i in range(len(labels)):
-                data_buffer[i]['Cluster'] = labels[i]
-
-        if score >= target_score and len(df) >= max_data_points:
-            print(f"\n✅ Training complete. Score: {score:.2f}, Samples: {len(df)}")
-            print("🔽 Saving training data to CSV...")
-            df['Time'] = [d['Time'] for d in data_buffer]
-            df.to_csv("training_dataset.csv", index=False)
-
-            centroids = kmeans.cluster_centers_
-            inverse_centroids = scaler.inverse_transform(centroids)
-
-            training_complete_message = "Training complete. Cluster centroids:<br>"
-            for i, centroid in enumerate(inverse_centroids):
-                training_complete_message += f"Cluster {i}: RSRP={centroid[0]:.2f}, RSRQ={centroid[1]:.2f}, SINR={centroid[2]:.2f}<br>"
-
-            training_stopped = True
-
+# Start threads
 ue_ports = find_ue_ports()
 if len(ue_ports) >= 2:
-    threading.Thread(target=monitor_ue, args=("ue0", ue_ports[0]), daemon=True).start()
-    threading.Thread(target=monitor_ue, args=("ue1", ue_ports[1]), daemon=True).start()
+    threading.Thread(target=monitor_ue, args=("ue0", ue_ports[0], ue0_buffer), daemon=True).start()
+    threading.Thread(target=monitor_ue, args=("ue1", ue_ports[1], ue1_buffer), daemon=True).start()
 else:
     print("Not enough Quectel UE ports found. Found:", ue_ports)
 
-threading.Thread(target=cluster_loop, daemon=True).start()
+
+# Dash app
+app = dash.Dash(__name__)
+app.title = "Live UE Test Dashboard"
+
+
+
 
 app.layout = html.Div([
-    html.H1("Live UE Signal & Clustering Dashboard", style={'textAlign': 'center'}),
-    dcc.Interval(id='interval', interval=250, n_intervals=0),
+    html.H2("Real-Time UE Testing Dashboard", style={'textAlign': 'center'}),
+    dcc.Interval(id="interval", interval=2000, n_intervals=0),
 
     html.Div([
         html.Div([
-            html.H3("UE0 Radio Measurements", style={'textAlign': 'center'}),
-            dcc.Graph(id='ue0_radio')
-        ], style={'width': '48%', 'display': 'inline-block'}),
+            html.H4("UE0 Radio Measurements", style={'textAlign': 'center'}),
+            dcc.Graph(id='ue0_signal', style={'height': '300px'}),
+            # html.H4("UE0 Cluster Timeline", style={'textAlign': 'center'}),
+            dcc.Graph(id='ue0_cluster', style={'height': '150px'}),
+            html.H4("UE0 State Timeline", style={'textAlign': 'center'}),  # 👈 Added
+            dcc.Graph(id='ue0_state', style={'height': '150px'})            # 👈 Added
+        ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top'}),
 
         html.Div([
-            html.H3("UE1 Radio Measurements", style={'textAlign': 'center'}),
-            dcc.Graph(id='ue1_radio')
-        ], style={'width': '48%', 'display': 'inline-block', 'float': 'right'})
-    ]),
-
-    html.Div([
+            html.H4("UE1 Radio Measurements", style={'textAlign': 'center'}),
+            dcc.Graph(id='ue1_signal', style={'height': '300px'}),
+            # html.H4("UE1 Cluster Timeline", style={'textAlign': 'center'}),
+            dcc.Graph(id='ue1_cluster', style={'height': '150px'}),
+            html.H4("UE1 State Timeline", style={'textAlign': 'center'}),  # 👈 Added
+            dcc.Graph(id='ue1_state', style={'height': '150px'})            # 👈 Added
+        ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+ 
         html.Div([
-            html.H3("UE0 Clusters", style={'textAlign': 'center'}),
-            dcc.Graph(id='ue0_cluster')
-        ], style={'width': '48%', 'display': 'inline-block'}),
+            html.H4("TSN/DetNet Replication Function", style={'textAlign': 'center'}),
+            dcc.Graph(id='tsn-replication', style={'height': '150px'})
+        ], style={'width': '100%', 'display': 'inline-block'}),
 
-        html.Div([
-            html.H3("UE1 Clusters", style={'textAlign': 'center'}),
-            dcc.Graph(id='ue1_cluster')
-        ], style={'width': '48%', 'display': 'inline-block', 'float': 'right'})
-    ]),
-
-    html.Div([
-        html.Div(id='clustering-status', style={
-            'textAlign': 'center',
-            'color': 'blue',
-            'fontWeight': 'bold',
-            'fontSize': '18px',
-            'marginTop': '10px'
-        }),
-        html.Div(id='training-summary', style={
-            'textAlign': 'center',
-            'color': 'green',
-            'fontWeight': 'bold',
-            'fontSize': '16px',
-            'marginTop': '5px'
-        })
     ])
 ])
 
+
+
+
+
+def generate_figs(buffer, label):
+    if not buffer:
+        return go.Figure(), go.Figure(), go.Figure(), go.Figure()
+
+    df = pd.DataFrame(buffer)
+    df = df.sort_values(by="Time")
+    df["Time"] = pd.to_datetime(df["Time"])
+
+    # Signal figure
+    signal_fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02)
+    signal_fig.add_trace(go.Scatter(x=df["Time"], y=df["RSRP"], mode='lines+markers', name='RSRP'), row=1, col=1)
+    signal_fig.add_trace(go.Scatter(x=df["Time"], y=df["RSRQ"], mode='lines+markers', name='RSRQ'), row=2, col=1)
+    signal_fig.add_trace(go.Scatter(x=df["Time"], y=df["SINR"], mode='lines+markers', name='SINR'), row=3, col=1)
+
+    # signal_fig.update_layout(
+    #     title=f"{label} Radio Measurement Timeline",
+    #     height=250,
+    #     showlegend=True
+    # )
+
+
+    # Cluster timeline with dynamic marker colors
+    cluster_colors = {0: 'green', 1: 'orange', 2: 'red'}
+    marker_colors = [cluster_colors.get(c, 'gray') for c in df['Cluster']]
+
+    cluster_fig = go.Figure()
+
+    cluster_fig.add_trace(go.Scatter(
+        x=df["Time"],
+        y=df["Cluster"],
+        mode='markers+lines',
+        marker=dict(color=marker_colors, size=8, symbol='circle'),
+        line=dict(color='black', width=1),  # Optional: keep or remove this line
+        name='Cluster'
+    ))
+
+    cluster_fig.update_yaxes(
+        tickvals=[0, 1, 2],
+        ticktext=['Green', 'Orange', 'Red'],
+        title="Cluster",
+        range=[-0.5, 2.5]
+    )
+
+    cluster_fig.update_layout(
+        title=f"{label} Clustering Timeline",
+        height=250,
+        showlegend=False
+    )
+
+    # ---------- Hysteresis-based State Tracking ----------
+
+    # Mapping logic
+    current_state = 'Red'
+    state_counters = {'Green': 0, 'Orange': 0, 'Red': 0}
+    transition_thresholds = {'Green': 21, 'Orange': 11, 'Red': 0}
+    actual_states = []
+
+    cluster_to_state = {0: 'Green', 1: 'Orange', 2: 'Red'}
+    state_to_number = {'Green': 0, 'Orange': 1, 'Red': 2}
+
+    def reset_counters():
+        for k in state_counters:
+            state_counters[k] = 0
+
+    for _, row in df.iterrows():
+        new_cluster_state = cluster_to_state[row['Cluster']]
+        if (new_cluster_state == 'Orange' and current_state == 'Green') or \
+           (new_cluster_state == 'Red' and current_state != 'Red'):
+            current_state = new_cluster_state
+            reset_counters()
+        else:
+            state_counters[new_cluster_state] += 1
+            if current_state == 'Red' and new_cluster_state == 'Orange' and state_counters['Orange'] >= transition_thresholds['Orange']:
+                current_state = 'Orange'
+                reset_counters()
+            elif current_state == 'Orange' and new_cluster_state == 'Green' and state_counters['Green'] >= transition_thresholds['Green']:
+                current_state = 'Green'
+                reset_counters()
+            elif current_state == 'Red' and new_cluster_state == 'Green' and state_counters['Green'] >= transition_thresholds['Green']:
+                current_state = 'Green'
+                reset_counters()
+        actual_states.append(state_to_number[current_state])
+
+    df['State'] = actual_states
+
+    # State Plot
+    actual_colors = {0: 'green', 1: 'orange', 2: 'red'}
+    actual_marker_colors = [actual_colors.get(s, 'gray') for s in df['State']]
+    
+    
+    actual_fig = go.Figure()
+    actual_fig.add_trace(go.Scatter(
+        x=df["Time"],
+        y=df["State"],
+        mode='markers+lines',
+        marker=dict(color=actual_marker_colors, size=8, symbol='circle'),
+        line=dict(color='black', width=1),
+        name='State'
+    ))
+    
+    
+    
+    actual_fig.update_yaxes(
+        tickvals=[0, 1, 2],
+        ticktext=['Green', 'Orange', 'Red'],
+        title="State",
+        range=[-0.5, 2.5]
+    )
+
+    actual_fig.update_layout(title=f"{label} State Timeline", height=250, showlegend=False)
+
+
+
+
+    # Align by index (assuming same length and time alignment)
+    tsn_state = []
+    for s0, s1 in zip(df0['State'], df1['State']):
+        if (s0 == 0 and s1 in [0, 1]) or (s1 == 0 and s0 in [0, 1]):
+            tsn_state.append(0)  # OFF
+        else:
+            tsn_state.append(1)  # ON
+
+    tsn_df = pd.DataFrame({
+        "Time": df0["Time"],  # or df1["Time"]
+        "TSN State": tsn_state
+    })
+
+
+    fig_tsn = go.Figure()
+    fig_tsn.add_trace(go.Scatter(
+        x=tsn_df["Time"],
+        y=tsn_df["TSN State"],
+        mode="lines+markers",
+        marker=dict(color=tsn_df["TSN State"].map({0: "green", 1: "red"})),
+        line=dict(shape="hv"),
+        name="TSN State"
+    ))
+    fig_tsn.update_layout(
+        title="TSN/DetNet Replication Function",
+        yaxis=dict(
+            tickvals=[0, 1],
+            ticktext=["OFF", "ON"],
+            range=[-0.5, 1.5]
+        ),
+        height=120,
+        margin=dict(t=40, b=40)
+    )
+
+
+
+
+
+
+    return signal_fig, cluster_fig, actual_fig
+
+
+
+
+
+
+
+
 @app.callback(
-    [Output('ue0_radio', 'figure'),
-     Output('ue1_radio', 'figure'),
-     Output('ue0_cluster', 'figure'),
-     Output('ue1_cluster', 'figure'),
-     Output('clustering-status', 'children'),
-     Output('training-summary', 'children')],
+    Output('ue0_signal', 'figure'),
+    Output('ue0_cluster', 'figure'),
+    Output('ue0_state', 'figure'),
+    Output('ue1_signal', 'figure'),
+    Output('ue1_cluster', 'figure'),
+    Output('ue1_state', 'figure'),
     Input('interval', 'n_intervals')
 )
-def update_graph(n):
-    global clustering_status, training_complete_message
-    with data_lock:
-        df = pd.DataFrame(data_buffer)
-        if df.empty or 'UE' not in df.columns:
-            return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No data", ""
 
-    fig_ue0 = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-                            subplot_titles=("RSRP", "RSRQ", "SINR"))
-    fig_ue1 = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-                            subplot_titles=("RSRP", "RSRQ", "SINR"))
-    fig_c0 = go.Figure()
-    fig_c1 = go.Figure()
+def update_graphs(n):
 
-    for ue, fig_r, fig_c in [("ue0", fig_ue0, fig_c0), ("ue1", fig_ue1, fig_c1)]:
-        sub = df[df['UE'] == ue]
-        if sub.empty:
-            continue
-        fig_r.add_trace(go.Scatter(x=sub['Time'], y=sub['RSRP'], mode='lines+markers', name='RSRP'), row=1, col=1)
-        fig_r.add_trace(go.Scatter(x=sub['Time'], y=sub['RSRQ'], mode='lines+markers', name='RSRQ'), row=2, col=1)
-        fig_r.add_trace(go.Scatter(x=sub['Time'], y=sub['SINR'], mode='lines+markers', name='SINR'), row=3, col=1)
+    fig0_sig, fig0_clu, fig0_state = generate_figs(ue0_buffer, "UE0")
+    fig1_sig, fig1_clu, fig1_state = generate_figs(ue1_buffer, "UE1")
 
-        if 'Cluster' in sub:
-            fig_c.add_trace(go.Scatter(x=sub['Time'], y=sub['Cluster'], mode='markers', name='Cluster'))
-            fig_c.update_layout(
-                yaxis=dict(tickmode='array', tickvals=[0, 1, 2], range=[-0.5, 2.5])
-            )
 
-    return fig_ue0, fig_ue1, fig_c0, fig_c1, clustering_status, training_complete_message
+    return fig0_sig, fig0_clu, fig0_state, fig1_sig, fig1_clu, fig1_state
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False, port=8050)

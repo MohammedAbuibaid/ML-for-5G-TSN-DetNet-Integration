@@ -12,10 +12,12 @@ from datetime import datetime
 import serial
 import time
 import pyudev
-
+import subprocess
 
 import os
 os.system("fuser -k 8050/tcp > /dev/null 2>&1")
+
+
 
 
 # Load saved artifacts
@@ -35,6 +37,13 @@ lock = threading.Lock()
 
 
 
+tx_data = []  # Each entry will be: {'Time': timestamp, 'wwan0': value, 'wwan1': value}
+last_tx_counts = {'wwan0': None, 'wwan1': None}
+last_timestamp = None
+
+pps_time_series = []
+
+MAX_PPS_THRESHOLD = 200000
 
 def find_ue_ports():
     context = pyudev.Context()
@@ -57,7 +66,22 @@ def find_ue_ports():
             selected_ports.append(sorted_ports[2])
     return sorted(selected_ports)
 
+def get_tx_packets(interface):
+    result = subprocess.run(["ip", "-s", "link", "show", interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lines = result.stdout.splitlines()
+    
+    # TX packets are typically on the 6th line (index 5), but you may need to adjust depending on system output
+    for i, line in enumerate(lines):
+        if "TX:" in line:
+            tx_line = lines[i + 1]  # next line contains the packet count
+            tx_packets = int(tx_line.strip().split()[0])
+            return tx_packets
+    return 0
 
+initial_tx_counts = {
+    'wwan0': get_tx_packets('wwan0'),
+    'wwan1': get_tx_packets('wwan1')
+}
 
 # Serial reader
 def monitor_ue(name, port, buffer):
@@ -69,7 +93,7 @@ def monitor_ue(name, port, buffer):
                 print(f"[{name}] Connected to {port}")
 
             ser.write(b'AT+QENG="servingcell"\r')
-            time.sleep(0.5)
+            time.sleep(0.25)
             response = ser.read_all().decode(errors='ignore')
             lines = [line for line in response.splitlines() if '+QENG:' in line]
 
@@ -106,7 +130,7 @@ def monitor_ue(name, port, buffer):
                     "PC2": -1 * pc[1]
                 })
 
-            time.sleep(1)
+            time.sleep(0.25)
 
         except Exception as e:
             print(f"[{name}] Error: {e}")
@@ -165,11 +189,17 @@ app.layout = html.Div([
             html.H4("TSN/DetNet Replication Function", style={'textAlign': 'center'}),
             dcc.Graph(id='tsn-replication', style={'height': '150px'})
         ], style={
-            'width': '60%',  # Adjust as needed
+            'width': '80%',  # Adjust as needed
             'margin': '0 auto',  # Center the block
             'display': 'block',  # Ensure it's a block-level element
             'textAlign': 'center'  # Optional, for contents inside
         }),
+
+
+        html.Div([
+            # html.H4("TX Packets Per Second", style={'textAlign': 'center'}),
+            dcc.Graph(id='pps_plot', style={'height': '250px'})
+        ], style={'width': '80%', 'margin': '0 auto'})
 
 
     ])
@@ -181,7 +211,8 @@ app.layout = html.Div([
 
 def generate_figs(buffer, label):
     if not buffer:
-        return go.Figure(), go.Figure(), go.Figure(), go.Figure()
+        empty_df = pd.DataFrame()  # Return an actual empty DataFrame
+        return go.Figure(), go.Figure(), go.Figure(), empty_df
 
     df = pd.DataFrame(buffer)
     df = df.sort_values(by="Time")
@@ -297,84 +328,121 @@ def generate_figs(buffer, label):
     Output('ue1_cluster', 'figure'),
     Output('ue1_state', 'figure'),
     Output('tsn-replication', 'figure'),
+    Output("pps_plot", "figure"),
     Input('interval', 'n_intervals')
 )
 
 def update_graphs(n):
-
-    # fig0_sig, fig0_clu, fig0_state = generate_figs(ue0_buffer, "UE0")
-    # fig1_sig, fig1_clu, fig1_state = generate_figs(ue1_buffer, "UE1")
-
-
     fig0_sig, fig0_clu, fig0_state, df0 = generate_figs(ue0_buffer, "UE0")
     fig1_sig, fig1_clu, fig1_state, df1 = generate_figs(ue1_buffer, "UE1")
 
-
-    if not df0.empty and not df1.empty:
+    # TSN logic based on both states
+    if df0.empty or df1.empty or 'State' not in df0 or 'State' not in df1:
+        # If any state missing → ON
+        time_series = df0["Time"] if not df0.empty else df1["Time"]
+        tsn_state = [1] * len(time_series)
+    else:
+        # Use aligned minimum length
+        min_len = min(len(df0), len(df1))
         tsn_state = []
-        if not df0.empty and not df1.empty:
-            for s0, s1 in zip(df0['State'], df1['State']):
-                if (s0 == 0 and s1 in [0, 1]) or (s1 == 0 and s0 in [0, 1]):
-                    tsn_state.append(0)  # OFF
-                else:
-                    tsn_state.append(1)  # ON
+        for s0, s1 in zip(df0['State'][:min_len], df1['State'][:min_len]):
+            if (s0 == 0 and s1 in [0, 1]) or (s1 == 0 and s0 in [0, 1]):
+                tsn_state.append(0)  # OFF
+            else:
+                tsn_state.append(1)  # ON
+        time_series = df0["Time"][:min_len]
 
-            tsn_df = pd.DataFrame({
-                "Time": df0["Time"],
-                "TSN State": tsn_state
-            })
+    # Always build tsn_df outside the conditions
+    tsn_df = pd.DataFrame({
+        "Time": time_series,
+        "TSN State": tsn_state
+    })
 
-            fig_tsn = go.Figure()
-            fig_tsn.add_trace(go.Scatter(
-                x=tsn_df["Time"],
-                y=tsn_df["TSN State"],
-                mode="lines+markers",
-                marker=dict(color=tsn_df["TSN State"].map({0: "green", 1: "red"})),
-                line=dict(shape="hv"),
-                name="TSN State"
-            ))
-            fig_tsn.update_layout(
-                title="TSN/DetNet Replication Function",
-                yaxis=dict(
-                    tickvals=[0, 1],
-                    ticktext=["OFF", "ON"],
-                    range=[-0.5, 1.5]
-                ),
-                height=120,
-                margin=dict(t=40, b=40)
-            )
-        else:
-            fig_tsn = go.Figure()
-
-
+    # 📊 Create TSN figure
+    fig_tsn = go.Figure()
+    fig_tsn.add_trace(go.Scatter(
+        x=tsn_df["Time"],
+        y=tsn_df["TSN State"],
+        mode="lines+markers",
+        marker=dict(color=tsn_df["TSN State"].map({0: "green", 1: "red"})),
+        line=dict(shape="hv"),
+        name="TSN State"
+    ))
+    fig_tsn.update_layout(
+        title="TSN/DetNet Replication Function",
+        yaxis=dict(
+            tickvals=[0, 1],
+            ticktext=["OFF", "ON"],
+            range=[-0.5, 1.5]
+        ),
+        height=120,
+        margin=dict(t=40, b=40)
+    )
 
 
+############################3
 
-        fig_tsn = go.Figure()
-        fig_tsn.add_trace(go.Scatter(
-            x=tsn_df["Time"],
-            y=tsn_df["TSN State"],
+
+    # Measure TX packets
+    current_time = datetime.now()
+    tx_pps = {}
+
+
+    global last_tx_counts, last_timestamp, pps_time_series
+
+    interfaces = ['wwan0', 'wwan1']
+    current_time = datetime.now()
+    total_tx_now = 0
+    total_tx_prev = 0
+
+    for iface in interfaces:
+        tx_now = get_tx_packets(iface) - initial_tx_counts[iface]
+
+        if last_tx_counts[iface] is not None:
+            total_tx_now += tx_now
+            total_tx_prev += last_tx_counts[iface]
+        last_tx_counts[iface] = tx_now
+
+    # Only compute if we have a previous timestamp
+    if last_timestamp is not None:
+        time_diff = (current_time - last_timestamp).total_seconds()
+        total_pps = (total_tx_now - total_tx_prev) / time_diff if time_diff > 0 else 0
+
+        if total_pps <= MAX_PPS_THRESHOLD:
+            pps_time_series.append({'Time': current_time, 'PPS': total_pps})
+
+    last_timestamp = current_time
+
+
+    # Convert to DataFrame and create figure
+    pps_df = pd.DataFrame(pps_time_series)
+    pps_fig = go.Figure()
+    if not pps_df.empty:
+        pps_fig.add_trace(go.Scatter(
+            x=pps_df["Time"],
+            y=pps_df["PPS"],
             mode="lines+markers",
-            marker=dict(color=tsn_df["TSN State"].map({0: "green", 1: "red"})),
-            line=dict(shape="hv"),
-            name="TSN State"
+            name="Total PPS",
+            line=dict(color="blue")
         ))
-        fig_tsn.update_layout(
-            title="TSN/DetNet Replication Function",
-            yaxis=dict(
-                tickvals=[0, 1],
-                ticktext=["OFF", "ON"],
-                range=[-0.5, 1.5]
-            ),
-            height=120,
-            margin=dict(t=40, b=40)
-        )
+    pps_fig.update_layout(
+        title="Total TX Packets Per Second (PPS)",
+        xaxis_title="Time",
+        yaxis_title="PPS",
+        height=200,
+        margin=dict(t=40, b=40)
+    )
 
 
 
-    return fig0_sig, fig0_clu, fig0_state, fig1_sig, fig1_clu, fig1_state, fig_tsn
 
-    # return fig0_sig, fig0_clu, fig0_state, fig1_sig, fig1_clu, fig1_state
+
+    return fig0_sig, fig0_clu, fig0_state, fig1_sig, fig1_clu, fig1_state, fig_tsn, pps_fig
+
+
+
+
+
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False, port=8050)
