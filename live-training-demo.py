@@ -6,6 +6,7 @@ from dash.dependencies import Input, Output
 import threading
 import time
 import serial
+# from serial import SerialException
 from datetime import datetime
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -352,4 +353,4 @@ def update_graph(n):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False, port=8050)
+    app.run(debug=True, use_reloader=False, port=8050, host='0.0.0.0')
