@@ -20,8 +20,10 @@ from sklearn.decomposition import PCA
 
 import joblib
 import json
-
+import errno
 import os
+import traceback
+
 os.system("fuser -k 8050/tcp > /dev/null 2>&1")
 
 training_complete = False
@@ -41,7 +43,7 @@ clustering_status = "Waiting for data..."
 def parse_fields(line, mode):
     fields = line.strip().split(',')
     if mode == "NR5G-SA":
-        return fields[13], fields[14], fields[15]
+        return fields[12], fields[13], fields[14]
     elif mode == "NR5G-NSA":
         return fields[11], fields[12], fields[14]
     elif mode == "LTE":
@@ -69,79 +71,136 @@ def find_ue_ports():
             selected_ports.append(sorted_ports[2])
     return sorted(selected_ports)
 
+def wait_for_device(name, port_path):
+    print(f"[{name}] Waiting for device {port_path}...")
+    while not os.path.exists(port_path):
+        time.sleep(3)
+    print(f"[{name}] Device {port_path} is back.")
+
+
+def read_radio_response(ser, name):
+    try:
+        ser.write(b'AT+QENG="servingcell"\r')
+        time.sleep(0.5)
+        response = ser.read_all().decode(errors='ignore').strip()
+
+        # print(f"[{name}] Raw Response:\n{response}\n")
+
+        lines = [line for line in response.splitlines() if "+QENG:" in line]
+        mode = "UNKNOWN"
+        rsrp = rsrq = sinr = "NA"
+
+        sa_line = next((l for l in lines if '"NR5G-SA"' in l), None)
+        nsa_line = next((l for l in lines if '"NR5G-NSA"' in l), None)
+        lte_line_nsa = next((l for l in lines if l.startswith('+QENG: "LTE"')), None)
+        lte_line = next((l for l in lines if ',"LTE",' in l and '"servingcell"' in l), None)
+
+        if sa_line:
+            mode = "NR5G-SA"
+            rsrp, rsrq, sinr = parse_fields(sa_line, mode)
+        elif nsa_line and lte_line_nsa:
+            mode = "NR5G-NSA"
+            rsrp, rsrq, sinr = parse_fields(lte_line_nsa, mode)
+        elif lte_line:
+            mode = "LTE"
+            rsrp, rsrq, sinr = parse_fields(lte_line, mode)
+        else:
+            print(f"[{name}] Warning: No valid QENG line matched.")
+
+        try:
+            rsrp_f, rsrq_f, sinr_f = float(rsrp), float(rsrq), float(sinr)
+            # print(f"[{name}] Parsed → mode={mode}, RSRP={rsrp_f}, RSRQ={rsrq_f}, SINR={sinr_f}")
+            return {"RSRP": rsrp_f, "RSRQ": rsrq_f, "SINR": sinr_f, "Mode": mode}
+        except ValueError as ve:
+            print(f"[{name}] Parsing error: couldn't convert RSRP/RSRQ/SINR to float → ({rsrp}, {rsrq}, {sinr})")
+            return None
+
+    except Exception as e:
+        print(f"[{name}] read_radio_response failed: {e}")
+        traceback.print_exc()
+        return None
 
 
 def monitor_ue(name, port_path):
     ser = None
+    lock_file = f"/var/lock/LCK..{os.path.basename(port_path)}"
+
     while True:
         try:
+            if not os.path.exists(port_path):
+                print(f"[{name}] Port missing: {port_path}")
+                if ser:
+                    try:
+                        ser.close()
+                        print(f"[{name}] Closed stale serial object.")
+                    except Exception as close_err:
+                        print(f"[{name}] Error closing serial: {close_err}")
+                    ser = None
+                wait_for_device(name, port_path)
+                continue
+
             if ser is None or not ser.is_open:
-                ser = serial.Serial(port_path, baudrate=115200, timeout=5)
-                print(f"[{name}] Connected to {port_path}")
+                try:
+                    ser = serial.Serial(port_path, baudrate=115200, timeout=5)
+                    print(f"[{name}] Connected to {port_path}")
+                except serial.SerialException as e:
+                    if e.errno == errno.EBUSY or "Device or resource busy" in str(e):
+                        print(f"[{name}] Port busy. Removing stale lock file.")
+                        if os.path.exists(lock_file):
+                            try:
+                                os.remove(lock_file)
+                                print(f"[{name}] Removed lock file: {lock_file}")
+                            except Exception as rm_err:
+                                print(f"[{name}] Failed to remove lock file: {rm_err}")
+                    else:
+                        print(f"[{name}] Serial open error: {e}")
+                    time.sleep(3)
+                    continue
 
-            ser.write(b'AT+QENG="servingcell"\r')
-            time.sleep(0.25)
-            response = ser.read_all().decode(errors='ignore').strip()
-
-            lines = response.splitlines()
-            lines = [line for line in lines if "+QENG:" in line]
-
-            mode = "UNKNOWN"
-            rsrp = rsrq = sinr = "NA"
-
-            sa_line = next((l for l in lines if '"NR5G-SA"' in l), None)
-            nsa_line = next((l for l in lines if '"NR5G-NSA"' in l), None)
-            lte_line_nsa = next((l for l in lines if l.startswith('+QENG: "LTE"')), None)
-            lte_line = next((l for l in lines if ',"LTE",' in l and '"servingcell"' in l), None)
-
-            if sa_line:
-                mode = "NR5G-SA"
-                rsrp, rsrq, sinr = parse_fields(sa_line, mode)
-            elif nsa_line and lte_line_nsa:
-                mode = "NR5G-NSA"
-                rsrp, rsrq, sinr = parse_fields(lte_line_nsa, mode)
-            elif lte_line:
-                mode = "LTE"
-                rsrp, rsrq, sinr = parse_fields(lte_line, mode)
-
-            try:
-                rsrp_f = float(rsrp)
-                rsrq_f = float(rsrq)
-                sinr_f = float(sinr)
+            result = read_radio_response(ser, name)
+            if result:
                 with data_lock:
                     data_buffer.append({
                         "UE": name,
-                        "RSRP": rsrp_f,
-                        "RSRQ": rsrq_f,
-                        "SINR": sinr_f,
+                        "RSRP": result["RSRP"],
+                        "RSRQ": result["RSRQ"],
+                        "SINR": result["SINR"],
                         "Time": datetime.now(),
                     })
-            except ValueError:
-                pass
 
-            time.sleep(0.25)
+            time.sleep(0.5)
+            
 
         except (serial.SerialException, OSError) as e:
-            print(f"[{name}] Connection error: {e}. Retrying in 3 seconds...")
+            print(f"[{name}] Serial/OSError: {e}")
+            traceback.print_exc()
             if ser:
                 try:
                     ser.close()
+                    print(f"[{name}] Serial closed due to error.")
                 except:
                     pass
                 ser = None
             time.sleep(3)
 
+        except Exception as ex:
+            print(f"[{name}] Unexpected error in monitor_ue: {ex}")
+            traceback.print_exc()
+            time.sleep(3)
+
+
 
 def cluster_loop():
     global clustering_status
-    max_data_points = 300
+    global training_complete
+    max_data_points = 200
     target_score = 0.4
     training_stopped = False
 
     while not training_stopped:
-        time.sleep(5)
+        time.sleep(2)
         with data_lock:
-            if len(data_buffer) < 5:
+            if len(data_buffer) < 12:
                 continue
             buffer_snapshot = data_buffer.copy()
         df = pd.DataFrame(buffer_snapshot)
@@ -156,15 +215,21 @@ def cluster_loop():
         labels = kmeans.labels_
         score = silhouette_score(scaled, labels)
 
-        clustering_status = f"Samples: {len(df)}, Silhouette Score: {score:.2f}"
+        # clustering_status = f"Samples: {len(df)}, Silhouette Score: {score:.2f}"
+        if not training_complete:
+            clustering_status = f"Samples: {len(df)}, Silhouette Score: {score:.2f}"
 
         with data_lock:
             for i in range(len(labels)):
                 data_buffer[i]['Cluster'] = labels[i]
 
+        # if score >= target_score and len(df) >= max_data_points:
+        #     print(f"\nTraining complete. Score: {score:.2f}, Samples: {len(df)}")
+        #     print("Saving training data and model...")
         if score >= target_score and len(df) >= max_data_points:
-            print(f"\n✅ Training complete. Score: {score:.2f}, Samples: {len(df)}")
-            print("🔽 Saving training data and model...")
+            clustering_status = f"✅ Training Complete! Score: {score:.2f} | Samples: {len(df)}"
+            print(f"\n{clustering_status}")
+            print("Saving training data and model...")
 
             df['Time'] = [d['Time'] for d in buffer_snapshot]
 
@@ -196,7 +261,6 @@ def cluster_loop():
             df.to_csv("training_dataset.csv", index=False)
 
             training_stopped = True
-            global training_complete
             training_complete = True
 
             # PCA and Plotting
@@ -252,10 +316,6 @@ def cluster_loop():
             plt.show()
 
 
-
-
-
-
 ue_ports = find_ue_ports()
 if len(ue_ports) >= 2:
     threading.Thread(target=monitor_ue, args=("ue0", ue_ports[0]), daemon=True).start()
@@ -266,40 +326,40 @@ else:
 threading.Thread(target=cluster_loop, daemon=True).start()
 
 app.layout = html.Div([
-    html.H1("Live UE Signal & Clustering Dashboard", style={'textAlign': 'center'}),
-    # dcc.Interval(id='interval', interval=250, n_intervals=0),
-    dcc.Interval(id='interval', interval=250, n_intervals=0, disabled=False),
+    html.H2("Real-time 5G-TSN/DetNet Training Dashboard", style={'textAlign': 'center', 'fontSize': '60px'}),
+    dcc.Interval(id='interval', interval=1000, n_intervals=0, disabled=False),
 
     html.Div([
         html.Div([
-            html.H3("UE0 Radio Measurements", style={'textAlign': 'center'}),
+            html.H4("UE0 Radio Measurements", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='ue0_radio')
         ], style={'width': '48%', 'display': 'inline-block'}),
 
         html.Div([
-            html.H3("UE1 Radio Measurements", style={'textAlign': 'center'}),
+            html.H4("UE1 Radio Measurements", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='ue1_radio')
         ], style={'width': '48%', 'display': 'inline-block', 'float': 'right'})
     ]),
 
+
+
     html.Div([
         html.Div([
-            html.H3("UE0 Clusters", style={'textAlign': 'center'}),
+            html.H4("UE0 Clusters", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='ue0_cluster')
         ], style={'width': '48%', 'display': 'inline-block'}),
 
         html.Div([
-            html.H3("UE1 Clusters", style={'textAlign': 'center'}),
+            html.H4("UE1 Clusters", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='ue1_cluster')
         ], style={'width': '48%', 'display': 'inline-block', 'float': 'right'})
     ]),
-
     html.Div([
         html.Div(id='clustering-status', style={
             'textAlign': 'center',
             'color': 'blue',
             'fontWeight': 'bold',
-            'fontSize': '18px',
+            'fontSize': '48px',
             'marginTop': '10px'
         })
     ])
@@ -324,7 +384,7 @@ def update_graph(n):
         df = pd.DataFrame(data_buffer)      
         
         if df.empty or 'UE' not in df.columns:
-            return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No data"
+            return go.Figure(), go.Figure(), go.Figure(), go.Figure(), "No data", training_complete
 
     fig_ue0 = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02,
                             subplot_titles=("RSRP", "RSRQ", "SINR"))
@@ -347,8 +407,7 @@ def update_graph(n):
                 yaxis=dict(tickmode='array', tickvals=[0, 1, 2], range=[-0.5, 2.5])
             )
 
-    # return fig_ue0, fig_ue1, fig_c0, fig_c1, clustering_status
-    
+            
     return fig_ue0, fig_ue1, fig_c0, fig_c1, clustering_status, training_complete
 
 

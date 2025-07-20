@@ -13,10 +13,12 @@ import serial
 import time
 import pyudev
 import subprocess
+import warnings
 
 import os
 os.system("fuser -k 8050/tcp > /dev/null 2>&1")
 
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 
 
@@ -101,7 +103,7 @@ def monitor_ue(name, port, buffer):
             if any('NR5G-SA' in l for l in lines):
                 target = next(l for l in lines if 'NR5G-SA' in l)
                 fields = target.split(',')
-                rsrp, rsrq, sinr = float(fields[13]), float(fields[14]), float(fields[15])
+                rsrp, rsrq, sinr = float(fields[12]), float(fields[13]), float(fields[14])
             elif any('NR5G-NSA' in l for l in lines):
                 lte = next(l for l in lines if '+QENG: "LTE"' in l)
                 fields = lte.split(',')
@@ -151,60 +153,96 @@ else:
 
 # Dash app
 app = dash.Dash(__name__)
-app.title = "Live UE Test Dashboard"
+app.title = "5G-TSN/DetNEt Test Dashboard"
+
+# app.layout = html.Div([
+#     html.H2("Real-Time UE Testing Dashboard", style={'textAlign': 'center'}),
+#     dcc.Interval(id="interval", interval=2000, n_intervals=0),
+
+#     html.Div([
+#         html.Div([
+#             html.H4("UE0 Radio Measurements", style={'textAlign': 'center'}),
+#             dcc.Graph(id='ue0_signal', style={'height': '300px'}),
+#             # html.H4("UE0 Cluster Timeline", style={'textAlign': 'center'}),
+#             dcc.Graph(id='ue0_cluster', style={'height': '150px'}),
+#             html.H4("UE0 State Timeline", style={'textAlign': 'center'}),  # 👈 Added
+#             dcc.Graph(id='ue0_state', style={'height': '150px'})            # 👈 Added
+#         ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+
+#         html.Div([
+#             html.H4("UE1 Radio Measurements", style={'textAlign': 'center'}),
+#             dcc.Graph(id='ue1_signal', style={'height': '300px'}),
+#             # html.H4("UE1 Cluster Timeline", style={'textAlign': 'center'}),
+#             dcc.Graph(id='ue1_cluster', style={'height': '150px'}),
+#             html.H4("UE1 State Timeline", style={'textAlign': 'center'}),  # 👈 Added
+#             dcc.Graph(id='ue1_state', style={'height': '150px'})            # 👈 Added
+#         ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+ 
+#         # html.Div([
+#         #     html.H4("TSN/DetNet Replication Function", style={'textAlign': 'center'}),
+#         #     dcc.Graph(id='tsn-replication', style={'height': '150px'})
+#         # ], style={'width': '48%', 'display': 'inline-block'}),
 
 
+#         html.Div([
+#             html.H4("TSN/DetNet Replication Function", style={'textAlign': 'center'}),
+#             dcc.Graph(id='tsn-replication', style={'height': '150px'})
+#         ], style={
+#             'width': '80%',  # Adjust as needed
+#             'margin': '0 auto',  # Center the block
+#             'display': 'block',  # Ensure it's a block-level element
+#             'textAlign': 'center'  # Optional, for contents inside
+#         }),
+
+
+#         html.Div([
+#             # html.H4("TX Packets Per Second", style={'textAlign': 'center'}),
+#             dcc.Graph(id='pps_plot', style={'height': '250px'})
+#         ], style={'width': '80%', 'margin': '0 auto'})
+
+
+#     ])
+# ])
 
 
 app.layout = html.Div([
-    html.H2("Real-Time UE Testing Dashboard", style={'textAlign': 'center'}),
-    dcc.Interval(id="interval", interval=2000, n_intervals=0),
+    html.H2("Real-Time 5G-TSN/DetNet Dynamic Replication Testing Dashboard", style={'textAlign': 'center', 'fontSize': '60px'}),  # Increased from default to 36px
+    dcc.Interval(id="interval", interval=1000, n_intervals=0),
 
     html.Div([
         html.Div([
-            html.H4("UE0 Radio Measurements", style={'textAlign': 'center'}),
+            html.H4("UE0 Radio Measurements", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='ue0_signal', style={'height': '300px'}),
-            # html.H4("UE0 Cluster Timeline", style={'textAlign': 'center'}),
             dcc.Graph(id='ue0_cluster', style={'height': '150px'}),
-            html.H4("UE0 State Timeline", style={'textAlign': 'center'}),  # 👈 Added
-            dcc.Graph(id='ue0_state', style={'height': '150px'})            # 👈 Added
+            html.H4("UE0 State Timeline", style={'textAlign': 'center', 'fontSize': '24px'}),
+            dcc.Graph(id='ue0_state', style={'height': '150px'})
         ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top'}),
 
         html.Div([
-            html.H4("UE1 Radio Measurements", style={'textAlign': 'center'}),
+            html.H4("UE1 Radio Measurements", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='ue1_signal', style={'height': '300px'}),
-            # html.H4("UE1 Cluster Timeline", style={'textAlign': 'center'}),
             dcc.Graph(id='ue1_cluster', style={'height': '150px'}),
-            html.H4("UE1 State Timeline", style={'textAlign': 'center'}),  # 👈 Added
-            dcc.Graph(id='ue1_state', style={'height': '150px'})            # 👈 Added
+            html.H4("UE1 State Timeline", style={'textAlign': 'center', 'fontSize': '24px'}),
+            dcc.Graph(id='ue1_state', style={'height': '150px'})
         ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top'}),
- 
-        # html.Div([
-        #     html.H4("TSN/DetNet Replication Function", style={'textAlign': 'center'}),
-        #     dcc.Graph(id='tsn-replication', style={'height': '150px'})
-        # ], style={'width': '48%', 'display': 'inline-block'}),
-
 
         html.Div([
-            html.H4("TSN/DetNet Replication Function", style={'textAlign': 'center'}),
+            html.H4("Dynamic TSN/DetNet Replication", style={'textAlign': 'center', 'fontSize': '48px'}),
             dcc.Graph(id='tsn-replication', style={'height': '150px'})
         ], style={
-            'width': '80%',  # Adjust as needed
-            'margin': '0 auto',  # Center the block
-            'display': 'block',  # Ensure it's a block-level element
-            'textAlign': 'center'  # Optional, for contents inside
+            'width': '80%',
+            # 'margin': '0 auto',
+            'margin': '120px auto 0 auto',  # Top margin added to push it down
+
+            'display': 'block',
+            'textAlign': 'center'
         }),
 
-
         html.Div([
-            # html.H4("TX Packets Per Second", style={'textAlign': 'center'}),
             dcc.Graph(id='pps_plot', style={'height': '250px'})
         ], style={'width': '80%', 'margin': '0 auto'})
-
-
     ])
 ])
-
 
 
 

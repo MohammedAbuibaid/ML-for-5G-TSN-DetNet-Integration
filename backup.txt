@@ -1,0 +1,141 @@
+# def monitor_ue(name, port_path):
+#     ser = None
+#     while True:
+#         try:
+#             if ser is None or not ser.is_open:
+#                 ser = serial.Serial(port_path, baudrate=115200, timeout=5)
+#                 print(f"[{name}] Connected to {port_path}")
+
+#             ser.write(b'AT+QENG="servingcell"\r')
+#             time.sleep(0.25)
+#             response = ser.read_all().decode(errors='ignore').strip()
+
+#             lines = response.splitlines()
+#             lines = [line for line in lines if "+QENG:" in line]
+
+#             mode = "UNKNOWN"
+#             rsrp = rsrq = sinr = "NA"
+
+#             sa_line = next((l for l in lines if '"NR5G-SA"' in l), None)
+#             nsa_line = next((l for l in lines if '"NR5G-NSA"' in l), None)
+#             lte_line_nsa = next((l for l in lines if l.startswith('+QENG: "LTE"')), None)
+#             lte_line = next((l for l in lines if ',"LTE",' in l and '"servingcell"' in l), None)
+
+#             if sa_line:
+#                 mode = "NR5G-SA"
+#                 rsrp, rsrq, sinr = parse_fields(sa_line, mode)
+#             elif nsa_line and lte_line_nsa:
+#                 mode = "NR5G-NSA"
+#                 rsrp, rsrq, sinr = parse_fields(lte_line_nsa, mode)
+#             elif lte_line:
+#                 mode = "LTE"
+#                 rsrp, rsrq, sinr = parse_fields(lte_line, mode)
+
+#             try:
+#                 rsrp_f = float(rsrp)
+#                 rsrq_f = float(rsrq)
+#                 sinr_f = float(sinr)
+#                 with data_lock:
+#                     data_buffer.append({
+#                         "UE": name,
+#                         "RSRP": rsrp_f,
+#                         "RSRQ": rsrq_f,
+#                         "SINR": sinr_f,
+#                         "Time": datetime.now(),
+#                     })
+#             except ValueError:
+#                 pass
+
+#             time.sleep(0.25)
+
+#         except (serial.SerialException, OSError) as e:
+#             print(f"[{name}] Connection error: {e}. Retrying in 3 seconds...")
+#             if ser:
+#                 try:
+#                     ser.close()
+#                 except:
+#                     pass
+#                 ser = None
+#             time.sleep(3)
+
+
+
+
+
+# def monitor_ue(name, port_path):
+#     ser = None
+#     lock_file = f"/var/lock/LCK..{os.path.basename(port_path)}"
+
+#     while True:
+#         try:
+#             if ser is None or not ser.is_open:
+#                 try:
+#                     ser = serial.Serial(port_path, baudrate=115200, timeout=5)
+#                     print(f"[{name}] Connected to {port_path}")
+#                 except serial.SerialException as e:
+#                     if e.errno == errno.EBUSY or "Device or resource busy" in str(e):
+#                         print(f"[{name}] Port busy. Attempting to remove stale lock file...")
+
+#                         # Try to remove stale lock file
+#                         if os.path.exists(lock_file):
+#                             try:
+#                                 os.remove(lock_file)
+#                                 print(f"[{name}] Removed stale lock file: {lock_file}")
+#                             except Exception as rm_err:
+#                                 print(f"[{name}] Could not remove lock file: {rm_err}")
+#                     else:
+#                         print(f"[{name}] SerialException: {e}")
+#                     time.sleep(3)
+#                     continue
+
+#             # Send AT command
+#             ser.write(b'AT+QENG="servingcell"\r')
+#             time.sleep(0.25)
+#             response = ser.read_all().decode(errors='ignore').strip()
+
+#             # Parse response
+#             lines = [line for line in response.splitlines() if "+QENG:" in line]
+#             mode = "UNKNOWN"
+#             rsrp = rsrq = sinr = "NA"
+
+#             sa_line = next((l for l in lines if '"NR5G-SA"' in l), None)
+#             nsa_line = next((l for l in lines if '"NR5G-NSA"' in l), None)
+#             lte_line_nsa = next((l for l in lines if l.startswith('+QENG: "LTE"')), None)
+#             lte_line = next((l for l in lines if ',"LTE",' in l and '"servingcell"' in l), None)
+
+#             if sa_line:
+#                 mode = "NR5G-SA"
+#                 rsrp, rsrq, sinr = parse_fields(sa_line, mode)
+#             elif nsa_line and lte_line_nsa:
+#                 mode = "NR5G-NSA"
+#                 rsrp, rsrq, sinr = parse_fields(lte_line_nsa, mode)
+#             elif lte_line:
+#                 mode = "LTE"
+#                 rsrp, rsrq, sinr = parse_fields(lte_line, mode)
+
+#             # Store data
+#             try:
+#                 rsrp_f, rsrq_f, sinr_f = float(rsrp), float(rsrq), float(sinr)
+#                 print(f"mode = {mode}, RSRP = {rsrp_f} RSRQ = {rsrq_f}, SINR = {sinr_f}")
+#                 with data_lock:
+#                     data_buffer.append({
+#                         "UE": name,
+#                         "RSRP": rsrp_f,
+#                         "RSRQ": rsrq_f,
+#                         "SINR": sinr_f,
+#                         "Time": datetime.now(),
+#                     })
+#             except ValueError:
+#                 pass
+
+#             time.sleep(0.25)
+
+#         except (serial.SerialException, OSError) as e:
+#             print(f"[{name}] Connection error: {e}. Retrying in 3 seconds...")
+#             if ser:
+#                 try:
+#                     ser.close()
+#                 except:
+#                     pass
+#                 ser = None
+#             time.sleep(3)
